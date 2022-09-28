@@ -32,11 +32,14 @@ module ScimRails
       else
         username_key = ScimRails.config.queryable_user_attributes[:userName]
         find_by_username = Hash.new
-        find_by_username[username_key] = permitted_user_params[username_key]
+        user_params = permitted_user_params
+        find_by_username[username_key.to_sym] = permitted_user_params[username_key.to_sym]
         user = @company
           .public_send(ScimRails.config.scim_users_scope)
           .find_or_create_by(find_by_username)
         user.update!(permitted_user_params)
+        user.reload
+        update_user(user) rescue ""
       end
       update_status(user) unless put_active_param.nil?
       json_scim_response(object: user, status: :created)
@@ -48,7 +51,9 @@ module ScimRails
     end
 
     def put_update
+      Rails.logger.error("scim put_update: " + params.to_json)
       user = @company.public_send(ScimRails.config.scim_users_scope).find(params[:id])
+      update_user(user) rescue ""
       update_status(user) unless put_active_param.nil?
       user.update!(permitted_user_params)
       json_scim_response(object: user)
@@ -57,9 +62,24 @@ module ScimRails
     # TODO: PATCH will only deprovision or reprovision users.
     # This will work just fine for Okta but is not SCIM compliant.
     def patch_update
+      Rails.logger.error("scim patch_update: " + params.to_json)
       user = @company.public_send(ScimRails.config.scim_users_scope).find(params[:id])
+      update_user(user) rescue ""
       update_status(user)
       json_scim_response(object: user)
+    end
+
+    def update_user(user)
+      user_params = {} 
+      operations = params["Operations"] || params[:Operations] || {}
+      postal_code = params[:addresses][0][:postalCode] || params["addresses"][0]["addresses"] rescue ""
+      if postal_code.blank?
+        postal_code = operations.find{|operation| (operation["path"] || operation[:path]).to_s.downcase == 'addresses[type eq "work"].postalcode' }[:value] rescue ""
+      end
+      if postal_code.present?
+        user_params.merge!({postal_code: postal_code})
+      end
+      user.update!(user_params)
     end
 
     private
@@ -77,7 +97,7 @@ module ScimRails
     end
 
     def find_value_for(attribute)
-      params.dig(*path_for(attribute))
+      params.dig(*path_for(attribute.to_s))
     end
 
     # `path_for` is a recursive method used to find the "path" for
@@ -91,21 +111,26 @@ module ScimRails
     def path_for(attribute, object = ScimRails.config.mutable_user_attributes_schema, path = [])
       at_path = path.empty? ? object : object.dig(*path)
       return path if at_path == attribute
-
+      result = nil
       case at_path
       when Hash
         at_path.each do |key, value|
           found_path = path_for(attribute, object, [*path, key])
-          return found_path if found_path
+          if found_path.present?
+            result = found_path
+            break
+          end
         end
-        nil
       when Array
         at_path.each_with_index do |value, index|
           found_path = path_for(attribute, object, [*path, index])
-          return found_path if found_path
+          if found_path.present?
+            result = found_path
+            break
+          end
         end
-        nil
       end
+      return result
     end
 
     def update_status(user)
@@ -115,14 +140,16 @@ module ScimRails
 
     def active?
       active = put_active_param
+      Rails.logger.error("scim active: " + active.to_s)
       active = patch_active_param if active.nil?
-
+      Rails.logger.error("scim active: " + active.to_s)
       case active
       when true, "true", 1
         true
       when false, "false", 0
         false
       else
+        Rails.logger.error("scim active: error")
         raise ActiveRecord::RecordInvalid
       end
     end
@@ -135,8 +162,9 @@ module ScimRails
       handle_invalid = lambda do
         raise ScimRails::ExceptionHandler::UnsupportedPatchRequest
       end
-
-      operations = params["Operations"] || {}
+      operations = params["Operations"] || params[:Operations] || {}
+      valid_operation = operations.find{|operation| (operation["op"] || operation[:op]).to_s.downcase == "replace" && (operation["path"] || operation[:path]).to_s.downcase == "active" } rescue {}
+      return valid_operation["value"].to_s.downcase == "true" if valid_operation.present?
 
       valid_operation = operations.find(handle_invalid) do |operation|
         valid_patch_operation?(operation)
@@ -144,6 +172,7 @@ module ScimRails
 
       valid_operation.dig("value", "active")
     end
+
 
     def valid_patch_operation?(operation)
       operation["op"].casecmp("replace") &&
